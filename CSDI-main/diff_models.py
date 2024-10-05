@@ -30,6 +30,8 @@ def get_linear_trans(heads=8,layers=1,channels=64,localheads=0,localwindow=0):
     )
 
 # creates a 1D convolution layer
+# initializes weights by Kaiming normalization. 
+# Helps the model perform better during training by setting an a starting point for weights
 def Conv1d_with_init(in_channels, out_channels, kernel_size):
     # in_channels: input size
     # out_channels: output size
@@ -57,7 +59,9 @@ class DiffusionEmbedding(nn.Module):
         # set up the fully connected layers, one for time and one for features
         self.projection1 = nn.Linear(embedding_dim, projection_dim)
         self.projection2 = nn.Linear(projection_dim, projection_dim)
-
+        
+    # the embeddings pass through two linear projections and an activation function
+    # transforms them into further model processing
     def forward(self, diffusion_step):
         x = self.embedding[diffusion_step] # retrieves the precomputed embedding table
         x = self.projection1(x) # embedding is passed through the first linear projection
@@ -75,6 +79,8 @@ class DiffusionEmbedding(nn.Module):
 
 
 # the deep learning diffusion model
+# input and output projections are convolutional layers that map input data to higher deminsion channels
+# then back to the original after processing
 class diff_CSDI(nn.Module):
     def __init__(self, config, inputdim=2):
         # config: predefined model configuration
@@ -95,6 +101,7 @@ class diff_CSDI(nn.Module):
         self.output_projection2 = Conv1d_with_init(self.channels, 1, 1) # reduce dimensionality to 1
         nn.init.zeros_(self.output_projection2.weight)
 
+        # The core of the model uses residual blocks that apply transformation to the input, stable connection
         self.residual_layers = nn.ModuleList( 
             [
                 ResidualBlock( # reisdual blocks that apply various transformations for better learning
