@@ -6,12 +6,12 @@ import pickle
 
 
 def train(
-    model,
-    config,
-    train_loader,
-    valid_loader=None,
-    valid_epoch_interval=20,
-    foldername="",
+    model, # PyTorch model being trained
+    config, # dictionary containing hyperparameters
+    train_loader, # dataloaders
+    valid_loader=None, 
+    valid_epoch_interval=20, # specifies how often to run validation
+    foldername="",    # specifies where to save the model after training
 ):
     # set up optimizer
     optimizer = Adam(model.parameters(), lr=config["lr"], weight_decay=1e-6)
@@ -94,6 +94,7 @@ def calc_denominator(target, eval_points):
     return torch.sum(torch.abs(target * eval_points))
 
 # get the actual CRPS
+# the target and forecast are first rescaled using scaler and mean_scaler to map predictions back to original scale
 def calc_quantile_CRPS(target, forecast, eval_points, mean_scaler, scaler):
 
     target = target * scaler + mean_scaler # ground truth values
@@ -110,7 +111,8 @@ def calc_quantile_CRPS(target, forecast, eval_points, mean_scaler, scaler):
         q_loss = quantile_loss(target, q_pred, quantiles[i], eval_points) # get the loss at each quantile
         CRPS += q_loss / denom
     return CRPS.item() / len(quantiles)
-
+    
+# sums the forecast across a dimension before calculating CRPS
 def calc_quantile_CRPS_sum(target, forecast, eval_points, mean_scaler, scaler):
 
     eval_points = eval_points.mean(-1)
