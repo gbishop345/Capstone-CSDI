@@ -12,9 +12,12 @@ def train(
     config,
     train_loader,
     valid_loader=None,
-    valid_epoch_interval=20,
+    valid_epoch_interval=10,
     foldername="",
 ):
+    if foldername != "":
+        output_path = foldername + "/model.pth"
+
     # Separate optimizers
     generator_params = [param for name, param in model.named_parameters() if 'discriminator' not in name]
     discriminator_params = [param for name, param in model.named_parameters() if 'discriminator' in name]
@@ -29,17 +32,19 @@ def train(
     lr_scheduler_G = torch.optim.lr_scheduler.MultiStepLR(
         optimizer_G, milestones=[p1, p2], gamma=0.1
     )
-    lr_scheduler_D = torch.optim.lr_scheduler.MultiStepLR(
-        optimizer_D, milestones=[p1, p2], gamma=0.1
+
+    lr_scheduler_D = torch.optim.lr_scheduler.ExponentialLR(
+        optimizer_D, gamma=0.99  # Reduce by 1% each epoch
     )
 
-    warmup_epochs = 10  # Number of epochs to warm up the generator
-    best_valid_loss = 1e10
+    best_valid_loss = float('inf')  # Initialize best validation loss
+    warmup_epochs = 20  # Number of epochs to warm up the generator
     for epoch_no in range(config["epochs"]):
         avg_gen_loss = 0
         avg_disc_loss = 0
         discriminator_updates = 0  # Initialize counter
-        n_critic = 5  # Update discriminator every n_critic iterations
+        n_critic = 12  # Update discriminator every n_critic iterations
+
         model.train()
         with tqdm(train_loader, mininterval=5.0, maxinterval=50.0) as it:
             for batch_no, train_batch in enumerate(it, start=1):
@@ -52,6 +57,7 @@ def train(
                     for_pattern_mask,
                     _,
                 ) = model.process_data(train_batch)
+
                 if model.target_strategy != "random":
                     cond_mask = model.get_hist_mask(observed_mask, for_pattern_mask=for_pattern_mask)
                 else:
@@ -66,7 +72,6 @@ def train(
                     observed_data, cond_mask, observed_mask, side_info, observed_tp, is_train=1
                 )
                 gen_loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer_G.step()
                 avg_gen_loss += gen_loss.item()
 
@@ -75,16 +80,10 @@ def train(
                 # ----------------------
                 if epoch_no >= warmup_epochs and batch_no % n_critic == 0:
                     optimizer_D.zero_grad()
-                    # Get discriminator loss
-                    with torch.no_grad():
-                        # Data is already prepared
-                        pass
-
                     discriminator_loss = model.compute_discriminator_loss(
                         observed_data, cond_mask, observed_mask, side_info, observed_tp, is_train=1
                     )
                     discriminator_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     optimizer_D.step()
                     avg_disc_loss += discriminator_loss.item()
                     discriminator_updates += 1  # Increment counter
@@ -101,7 +100,7 @@ def train(
                 if batch_no >= config["itr_per_epoch"]:
                     break
 
-            lr_scheduler_G.step()
+            # Step the discriminator scheduler every epoch
             if epoch_no >= warmup_epochs:
                 lr_scheduler_D.step()
 
@@ -121,18 +120,22 @@ def train(
                             },
                             refresh=False,
                         )
-            if best_valid_loss > avg_loss_valid:
+
+            avg_loss_valid /= len(valid_loader)
+
+            # Use the validation loss to update the generator's learning rate scheduler
+            lr_scheduler_G.step(avg_loss_valid)
+
+            if avg_loss_valid < best_valid_loss:
                 best_valid_loss = avg_loss_valid
+
+                # Display the best loss of the epoch
                 print(
-                    "\n Best loss updated to ",
-                    avg_loss_valid / batch_no,
-                    "at epoch",
-                    epoch_no,
+                    f"\nBest validation loss updated to {avg_loss_valid} at epoch {epoch_no}"
                 )
 
-    # Save model if foldername is provided
+    # Save only the final model at the end of training
     if foldername != "":
-        output_path = foldername + "/model.pth"
         torch.save(model.state_dict(), output_path)
 
 # get the quantile loss for CRPS using weighted error based on q
