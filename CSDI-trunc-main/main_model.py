@@ -36,7 +36,7 @@ class CSDI_base(nn.Module):
 
         # Initialize the discriminator with input channels matching the diffusion model's output
         input_channels = self.target_dim  # Assuming data has 'target_dim' channels
-        hidden_dim = 64  # Default hidden dimension for the discriminator
+        hidden_dim = 32  # Default hidden dimension for the discriminator
         temb_dim = self.emb_time_dim  # Use the same temporal embedding dimension
         self.discriminator = Discriminator(input_channels=input_channels, hidden_dim=hidden_dim, temb_dim=temb_dim)
 
@@ -218,11 +218,6 @@ class CSDI_base(nn.Module):
             # Combine the usual noise prediction loss with adversarial loss
             loss += loss_gan * self.lambda_gan
 
-            # Add JS divergence
-            real_data_at_T_trunc = observed_data[t_trunc_indices]
-            js_div = self.js_divergence(fake_data_at_T_trunc, real_data_at_T_trunc)
-            loss += js_div * self.lambda_js
-
         return loss
 
     def compute_discriminator_loss(self, observed_data, cond_mask, observed_mask, side_info, observed_tp, is_train):
@@ -259,8 +254,8 @@ class CSDI_base(nn.Module):
         temb = time_embed[:, -1, :]
 
         # Discriminator loss
-        real_labels = torch.full((B, 1), 0.9).to(self.device)  # Label smoothing 
-        fake_labels = torch.full((B, 1), 0.1).to(self.device)  # Label smoothing 
+        real_labels = torch.ones(B, 1).to(self.device)  # Standard real label (1)
+        fake_labels = torch.zeros(B, 1).to(self.device)  # Standard fake label (0)
 
 
         real_output = self.discriminator(real_data_at_T_trunc, temb)
@@ -382,55 +377,51 @@ def Normalize(in_channels):
 
 # 1D Residual Block with Dynamic Shape Handling for Timestep Embeddings
 class ResnetBlock1D(nn.Module):
-    def __init__(self, in_channels, out_channels=None, conv_shortcut=False, dropout=0.3, temb_channels=None):
+    def __init__(self, in_channels, out_channels=None, conv_shortcut=False, dropout=0.4, temb_channels=None):
         super().__init__()
         self.in_channels = in_channels
         out_channels = in_channels if out_channels is None else out_channels
         self.out_channels = out_channels
         self.use_conv_shortcut = conv_shortcut
 
-        # Apply spectral normalization to the convolution layers
-        self.norm1 = Normalize(in_channels)
+        # Only apply spectral norm to the first convolution layer for stability
         self.conv1 = spectral_norm(nn.Conv1d(in_channels, out_channels, kernel_size=3, stride=1, padding=1))
+
+        # Consider removing one normalization layer
+        self.norm1 = Normalize(in_channels)  # Maintain first normalization
 
         if temb_channels is None:
             raise ValueError("temb_channels (temporal embedding dimension) must be provided!")
 
+        # Temporal embedding projection remains
         self.temb_proj = nn.Linear(temb_channels, out_channels)
-        self.norm2 = Normalize(out_channels)
-        self.dropout = nn.Dropout(dropout)
-        self.conv2 = spectral_norm(nn.Conv1d(out_channels, out_channels, kernel_size=3, stride=1, padding=1))
 
+        # Simplify dropout, normalization, and the second convolution
+        self.dropout = nn.Dropout(dropout)
+        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
+
+        # Consider whether to use shortcut or nin_shortcut based on in/out channels
         if self.in_channels != self.out_channels:
             if self.use_conv_shortcut:
                 self.conv_shortcut = spectral_norm(nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=1))
             else:
-                self.nin_shortcut = spectral_norm(nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=1))
-
+                self.nin_shortcut = nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=1)
 
     def forward(self, x, temb):
-        # Ensure temb has the correct dimensions
-        if temb.dim() == 2:  # When temb is (B, temb_dim)
-            B, temb_dim = temb.shape
-        else:
-            raise RuntimeError(f"Unexpected shape for temb: {temb.shape}")
-
-        if temb_dim != self.temb_proj.in_features:
-            raise RuntimeError(f"Expected temb to have {self.temb_proj.in_features} features, but got {temb_dim}.")
-
         # Process x and temb
         h = self.norm1(x)
         h = F.leaky_relu(h, 0.2)
-        h = self.conv1(h)
+        h = self.conv1(h)  # Spectral norm applied here
 
-        # Apply temb projection and adjust for batch
+        # Apply temporal embedding projection and adjust for batch
         h = h + self.temb_proj(F.leaky_relu(temb, 0.2)).unsqueeze(-1)
 
-        h = self.norm2(h)
+        # Use only one normalization, dropout, and simplified second convolution
         h = F.leaky_relu(h, 0.2)
         h = self.dropout(h)
-        h = self.conv2(h)
+        h = self.conv2(h)  # No spectral norm on the second conv for simplicity
 
+        # Apply shortcut if necessary
         if self.in_channels != self.out_channels:
             if self.use_conv_shortcut:
                 x = self.conv_shortcut(x)
@@ -441,38 +432,35 @@ class ResnetBlock1D(nn.Module):
 
 # 1D Discriminator Block
 class Discriminator(nn.Module):
-    def __init__(self, input_channels, hidden_dim, temb_dim):
+    def __init__(self, input_channels, hidden_dim=32, temb_dim=64):
         super().__init__()
 
-        # Input convolution layer
+        # Apply spectral normalization to the first convolutional layer only
         self.input_conv = nn.Sequential(
-            nn.Conv1d(input_channels, hidden_dim, kernel_size=3, stride=1, padding=1),
+            spectral_norm(nn.Conv1d(input_channels, hidden_dim, kernel_size=3, stride=1, padding=1)),  # Spectral norm here
             nn.LeakyReLU(0.2),
             nn.BatchNorm1d(hidden_dim)
         )
 
-        # Residual blocks with timestep embedding
         self.resblock1 = ResnetBlock1D(hidden_dim, hidden_dim * 2, temb_channels=temb_dim)
         self.resblock2 = ResnetBlock1D(hidden_dim * 2, hidden_dim * 4, temb_channels=temb_dim)
 
-        # Output layers
         self.output_layer = nn.Sequential(
-            nn.Conv1d(hidden_dim * 4, 1, kernel_size=3, stride=1, padding=1),
+            nn.Conv1d(hidden_dim * 4, 1, kernel_size=3, stride=1, padding=1),  # No spectral norm here
             nn.AdaptiveAvgPool1d(1),
             nn.Flatten(),
             nn.Sigmoid()
         )
 
     def forward(self, x, temb):
-        # x should be of shape [B, K, L]
-        # Ensure x has the correct shape
         if x.dim() > 3:
-            x = x.view(x.size(0), x.size(1), -1)  # Merge extra dimensions
+            x = x.view(x.size(0), x.size(1), -1)
 
-        x = self.input_conv(x)  # x is now [B, hidden_dim, L]
+        x = self.input_conv(x)  # Spectral norm applied here
         x = self.resblock1(x, temb)
         x = self.resblock2(x, temb)
         x = self.output_layer(x)
+
         return x
 
 
@@ -671,3 +659,4 @@ class CSDI_Forecasting(CSDI_base):
             samples = self.impute(observed_data, cond_mask, side_info, n_samples) # get the imputated values
 
         return samples, observed_data, target_mask, observed_mask, observed_tp
+
