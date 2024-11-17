@@ -36,7 +36,7 @@ class CSDI_base(nn.Module):
 
         # Initialize the discriminator with input channels matching the diffusion model's output
         input_channels = self.target_dim  # Assuming data has 'target_dim' channels
-        hidden_dim = 32  # Default hidden dimension for the discriminator
+        hidden_dim = 64  # Default hidden dimension for the discriminator
         temb_dim = self.emb_time_dim  # Use the same temporal embedding dimension
         self.discriminator = Discriminator(input_channels=input_channels, hidden_dim=hidden_dim, temb_dim=temb_dim)
 
@@ -131,19 +131,14 @@ class CSDI_base(nn.Module):
         average_loss = loss_sum / self.num_steps
         return average_loss
     
-    def softmax(self, tensor, dim=-1):
-        # Exponentiate each value 
-        exp_tensor = torch.exp(tensor - torch.max(tensor, dim=dim, keepdim=True).values)
+    def stable_softmax(self, tensor, dim=-1):
+        tensor_max, _ = torch.max(tensor, dim=dim, keepdim=True)
+        tensor_exp = torch.exp(tensor - tensor_max)
+        tensor_exp_sum = torch.sum(tensor_exp, dim=dim, keepdim=True)
+        softmax = tensor_exp / tensor_exp_sum
+        return softmax
 
-        # Sum the exponentiated values along the specified dimension
-        sum_exp_tensor = torch.sum(exp_tensor, dim=dim, keepdim=True)
-
-        # Divide each exponentiated value by the sum of exponentiated values
-        softmax_tensor = exp_tensor / sum_exp_tensor
-
-        return softmax_tensor
-
-    #Compute Jensen-Shannon Divergence 
+    #Compute stable Jensen-Shannon Divergence 
     def js_divergence(self, p, q, eps=1e-8):
 
         # Add epsilon for numerical stability
@@ -151,18 +146,16 @@ class CSDI_base(nn.Module):
         q = q + eps
 
         # Apply softmax to convert to probability distributions
-        p = self.softmax(p, dim=-1)
-        q = self.softmax(q, dim=-1)
+        p = self.stable_softmax(p, dim=-1)
+        q = self.stable_softmax(q, dim=-1)
+
+        p = torch.clamp(p, min=eps)
+        q = torch.clamp(q, min=eps)
 
         # Compute the midpoint
         m = 0.5 * (p + q)
-
-        # Compute KL divergence between p and m, and q and m
-        kl_pm = F.kl_div(p.log(), m, reduction='batchmean')
-        kl_qm = F.kl_div(q.log(), m, reduction='batchmean')
-
-        # Return the average of the two
-        return 0.5 * (kl_pm + kl_qm)
+        js_div = 0.5 * (F.kl_div(p.log(), m, reduction='batchmean') + F.kl_div(q.log(), m, reduction='batchmean'))
+        return js_div
 
     def compute_generator_loss(self, observed_data, cond_mask, observed_mask, side_info, observed_tp, is_train, set_t=-1):
         B, K, L = observed_data.shape
@@ -171,11 +164,12 @@ class CSDI_base(nn.Module):
         if is_train != 1:
             t = (torch.ones(B) * set_t).long().to(self.device)
         else:
-            t = torch.randint(0, self.T_trunc, [B]).to(self.device)
-            # Ensure at least one sample is at T_trunc - 1
-            if (t == self.T_trunc - 1).sum() == 0:
-                random_index = torch.randint(0, B, (1,))
-                t[random_index] = self.T_trunc - 1
+            # Adjust the probability distribution to oversample T_trunc - 1
+            t_probs = torch.ones(self.T_trunc)
+            oversampling_factor = 2  # Adjust this factor as needed
+            t_probs[-1] *= oversampling_factor  # Increase probability for T_trunc - 1
+            t_probs = t_probs / t_probs.sum()
+            t = torch.multinomial(t_probs, B, replacement=True).to(self.device)
 
         current_alpha = self.alpha_torch[t]
         noise = torch.randn_like(observed_data)
@@ -199,7 +193,6 @@ class CSDI_base(nn.Module):
 
             # Get alpha_t for the indices at T_trunc
             alpha_t = self.alpha_torch[t[t_trunc_indices]].squeeze(-1).squeeze(-1)
-
             sqrt_alpha_t = torch.sqrt(alpha_t)[:, None, None]
             sqrt_one_minus_alpha_t = torch.sqrt(1.0 - alpha_t)[:, None, None]
 
@@ -215,15 +208,21 @@ class CSDI_base(nn.Module):
             real_labels = torch.ones(fake_output_for_g.size(0), 1).to(self.device)
             loss_gan = F.binary_cross_entropy(fake_output_for_g, real_labels)
 
-            # Combine the usual noise prediction loss with adversarial loss
+            # Add GAN loss term
             loss += loss_gan * self.lambda_gan
+
+            # Compute JS divergence between predicted noise and actual noise
+            js_loss = self.js_divergence(predicted[t_trunc_indices], noise[t_trunc_indices])
+
+            # Add JS divergence loss term
+            loss += js_loss * self.lambda_js
 
         return loss
 
     def compute_discriminator_loss(self, observed_data, cond_mask, observed_mask, side_info, observed_tp, is_train):
         B, K, L = observed_data.shape
 
-        # Use T_trunc - 1 for discriminator training
+        # Prepare noise and real/fake data at T_trunc
         t = torch.tensor([self.T_trunc - 1] * B).long().to(self.device)
         current_alpha = self.alpha_torch[t]
         noise = torch.randn_like(observed_data)
@@ -233,41 +232,41 @@ class CSDI_base(nn.Module):
             total_input = self.set_input_to_diffmodel(noisy_data, observed_data, cond_mask)
             predicted = self.diffmodel(total_input, side_info, t)
 
-        sqrt_alpha_t = torch.sqrt(current_alpha)[:, None, None]
-        sqrt_one_minus_alpha_t = torch.sqrt(1.0 - current_alpha)[:, None, None]
-
+        # Get real and fake data at T_trunc
+        sqrt_alpha_t = torch.sqrt(current_alpha).view(B, 1, 1).expand(B, K, L)
+        sqrt_one_minus_alpha_t = torch.sqrt(1.0 - current_alpha).view(B, 1, 1).expand(B, K, L)
         fake_data_at_T_trunc = (noisy_data - sqrt_one_minus_alpha_t * predicted) / sqrt_alpha_t
         fake_data_at_T_trunc = fake_data_at_T_trunc.detach()
-
-        # Reshape fake_data_at_T_trunc if necessary
-        if fake_data_at_T_trunc.dim() > 3:
-            fake_data_at_T_trunc = fake_data_at_T_trunc.reshape(B, K, -1)
-
         real_data_at_T_trunc = observed_data
-
-        # Reshape real_data_at_T_trunc if necessary
-        if real_data_at_T_trunc.dim() > 3:
-            real_data_at_T_trunc = real_data_at_T_trunc.reshape(B, K, -1)
 
         # Get time embeddings
         time_embed = self.time_embedding(observed_tp, self.emb_time_dim)
         temb = time_embed[:, -1, :]
 
-        # Discriminator loss
-        real_labels = torch.ones(B, 1).to(self.device)  # Standard real label (1)
-        fake_labels = torch.zeros(B, 1).to(self.device)  # Standard fake label (0)
-
-
+        # Discriminator output for real and fake samples
         real_output = self.discriminator(real_data_at_T_trunc, temb)
         fake_output = self.discriminator(fake_data_at_T_trunc, temb)
 
-        real_loss_d = F.binary_cross_entropy(real_output, real_labels)
-        fake_loss_d = F.binary_cross_entropy(fake_output, fake_labels)
-        discriminator_loss = (real_loss_d + fake_loss_d) / 2
+        # Labels for real and fake samples
+        real_labels = torch.ones_like(real_output).to(self.device)
+        fake_labels = torch.zeros_like(fake_output).to(self.device)
 
-        return discriminator_loss
+        # Implement label flipping
+        flip_prob = 0.03  # 5% probability to flip labels
+        flip_mask_real = torch.rand_like(real_labels) < flip_prob
+        flip_mask_fake = torch.rand_like(fake_labels) < flip_prob
+
+        # Flip the labels
+        real_labels = torch.where(flip_mask_real, torch.zeros_like(real_labels), real_labels)
+        fake_labels = torch.where(flip_mask_fake, torch.ones_like(fake_labels), fake_labels)
+
+        # Binary Cross-Entropy Loss for discriminator
+        D_loss_real = F.binary_cross_entropy(real_output, real_labels)
+        D_loss_fake = F.binary_cross_entropy(fake_output, fake_labels)
+        D_loss = D_loss_real + D_loss_fake
+
+        return D_loss
     
-    # conmbines noise and observed vales based on mask and conditional
     def set_input_to_diffmodel(self, noisy_data, observed_data, cond_mask):
         if self.is_unconditional:
             total_input = noisy_data.unsqueeze(1)  # (B,1,K,L)
@@ -375,37 +374,55 @@ def nonlinearity(x):
 def Normalize(in_channels):
     return nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
 
-# 1D Residual Block with Dynamic Shape Handling for Timestep Embeddings
+# 1D Residual Block with Leaky ReLU and Dropout
 class ResnetBlock1D(nn.Module):
-    def __init__(self, in_channels, out_channels=None, conv_shortcut=False, dropout=0.4, temb_channels=None):
+    def __init__(self, in_channels, out_channels=None, conv_shortcut=False, dropout=0.3, temb_channels=None):
         super().__init__()
         self.in_channels = in_channels
         out_channels = in_channels if out_channels is None else out_channels
         self.out_channels = out_channels
         self.use_conv_shortcut = conv_shortcut
 
-        # Only apply spectral norm to the first convolution layer for stability
+        # Spectral normalization for stability in first convolution layer
         self.conv1 = spectral_norm(nn.Conv1d(in_channels, out_channels, kernel_size=3, stride=1, padding=1))
-
-        # Consider removing one normalization layer
-        self.norm1 = Normalize(in_channels)  # Maintain first normalization
+        self.norm1 = Normalize(in_channels)
 
         if temb_channels is None:
             raise ValueError("temb_channels (temporal embedding dimension) must be provided!")
 
-        # Temporal embedding projection remains
+        # Temporal embedding projection
         self.temb_proj = nn.Linear(temb_channels, out_channels)
-
-        # Simplify dropout, normalization, and the second convolution
+        self.leaky_relu = nn.LeakyReLU(0.2)
         self.dropout = nn.Dropout(dropout)
+
+        # Second convolution without spectral norm for simplicity
         self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
 
-        # Consider whether to use shortcut or nin_shortcut based on in/out channels
+        # Shortcut connection
         if self.in_channels != self.out_channels:
             if self.use_conv_shortcut:
                 self.conv_shortcut = spectral_norm(nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=1))
             else:
                 self.nin_shortcut = nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=1)
+
+    def forward(self, x, temb):
+        # Main path
+        h = self.norm1(x)
+        h = self.leaky_relu(h)
+        h = self.conv1(h)
+        h = h + self.temb_proj(self.leaky_relu(temb)).unsqueeze(-1)
+        h = self.leaky_relu(h)
+        h = self.dropout(h)
+        h = self.conv2(h)
+
+        # Shortcut path
+        if self.in_channels != self.out_channels:
+            if self.use_conv_shortcut:
+                x = self.conv_shortcut(x)
+            else:
+                x = self.nin_shortcut(x)
+
+        return x + h
 
     def forward(self, x, temb):
         # Process x and temb
@@ -446,7 +463,7 @@ class Discriminator(nn.Module):
         self.resblock2 = ResnetBlock1D(hidden_dim * 2, hidden_dim * 4, temb_channels=temb_dim)
 
         self.output_layer = nn.Sequential(
-            nn.Conv1d(hidden_dim * 4, 1, kernel_size=3, stride=1, padding=1),  # No spectral norm here
+            spectral_norm(nn.Conv1d(hidden_dim * 4, 1, kernel_size=3, stride=1, padding=1)),  # No spectral norm here
             nn.AdaptiveAvgPool1d(1),
             nn.Flatten(),
             nn.Sigmoid()
@@ -659,4 +676,5 @@ class CSDI_Forecasting(CSDI_base):
             samples = self.impute(observed_data, cond_mask, side_info, n_samples) # get the imputated values
 
         return samples, observed_data, target_mask, observed_mask, observed_tp
+
 
