@@ -248,21 +248,29 @@ class CSDI_base(nn.Module):
         fake_output = self.discriminator(fake_data_at_T_trunc, temb)
 
         # Labels for real and fake samples
-        real_labels = torch.ones_like(real_output).to(self.device)
-        fake_labels = torch.zeros_like(fake_output).to(self.device)
+        # real_labels = torch.ones_like(real_output).to(self.device)
+        # fake_labels = torch.zeros_like(fake_output).to(self.device)
+        real_labels = torch.zeros(B, dtype=torch.long).to(self.device)  # Class 0 for real
+        fake_labels = torch.ones(B, dtype=torch.long).to(self.device)   # Class 1 for fake
 
         # Implement label flipping
         flip_prob = 0.03  # 5% probability to flip labels
-        flip_mask_real = torch.rand_like(real_labels) < flip_prob
-        flip_mask_fake = torch.rand_like(fake_labels) < flip_prob
+        # flip_mask_real = torch.rand_like(real_labels) < flip_prob
+        # flip_mask_fake = torch.rand_like(fake_labels) < flip_prob
+        flip_mask_real = torch.rand(B) < flip_prob
+        flip_mask_fake = torch.rand(B) < flip_prob
 
+        
         # Flip the labels
-        real_labels = torch.where(flip_mask_real, torch.zeros_like(real_labels), real_labels)
-        fake_labels = torch.where(flip_mask_fake, torch.ones_like(fake_labels), fake_labels)
+        # real_labels = torch.where(flip_mask_real, torch.zeros_like(real_labels), real_labels)
+        # fake_labels = torch.where(flip_mask_fake, torch.ones_like(fake_labels), fake_labels)
+        real_labels[flip_mask_real] = 1  # Flip real labels to fake class
+        fake_labels[flip_mask_fake] = 0  # Flip fake labels to real class
 
+        
         # Binary Cross-Entropy Loss for discriminator
-        D_loss_real = F.binary_cross_entropy(real_output, real_labels)
-        D_loss_fake = F.binary_cross_entropy(fake_output, fake_labels)
+        D_loss_real = F.cross_entropy(real_output, real_labels)
+        D_loss_fake = F.cross_entropy(fake_output, fake_labels)
         D_loss = D_loss_real + D_loss_fake
 
         return D_loss
