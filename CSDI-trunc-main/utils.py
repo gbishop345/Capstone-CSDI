@@ -3,7 +3,6 @@ import torch
 from torch.optim import Adam
 from tqdm import tqdm
 import pickle
-import torch
 
 torch.autograd.set_detect_anomaly(True)
 
@@ -16,7 +15,8 @@ def train(
     foldername="",
 ):
     if foldername != "":
-        output_path = foldername + "/model.pth"
+        best_model_path = foldername + "/best_model.pth"  # Path to save the best model
+        final_model_path = foldername + "/final_model.pth"  # Path to save the final model
 
     # Separate optimizers
     generator_params = [param for name, param in model.named_parameters() if 'discriminator' not in name]
@@ -24,26 +24,26 @@ def train(
 
     # Create separate optimizers
     optimizer_G = Adam(generator_params, lr=config["lr"], weight_decay=1e-6)
-    optimizer_D = Adam(discriminator_params, lr=config["lr"], weight_decay=1e-6)
+    optimizer_D = Adam(discriminator_params, lr=config["lr"] * 0.5, weight_decay=1e-6)
 
     # Learning rate schedulers
     p1 = int(0.75 * config["epochs"])
     p2 = int(0.9 * config["epochs"])
-    lr_scheduler_G = torch.optim.lr_scheduler.MultiStepLR(
-        optimizer_G, milestones=[p1, p2], gamma=0.1
+    lr_scheduler_G = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer_G, mode='min', factor=0.1, patience=5, verbose=True
     )
 
-    lr_scheduler_D = torch.optim.lr_scheduler.ExponentialLR(
-        optimizer_D, gamma=0.99  # Reduce by 1% each epoch
+    lr_scheduler_D = torch.optim.lr_scheduler.MultiStepLR(
+        optimizer_D, milestones=[p1, p2], gamma=0.1
     )
 
     best_valid_loss = float('inf')  # Initialize best validation loss
-    warmup_epochs = 20  # Number of epochs to warm up the generator
+    warmup_epochs = 10  # Number of epochs to warm up the generator
     for epoch_no in range(config["epochs"]):
         avg_gen_loss = 0
         avg_disc_loss = 0
         discriminator_updates = 0  # Initialize counter
-        n_critic = 12  # Update discriminator every n_critic iterations
+        n_critic = 5  # Update discriminator every n_critic iterations
 
         model.train()
         with tqdm(train_loader, mininterval=5.0, maxinterval=50.0) as it:
@@ -100,9 +100,9 @@ def train(
                 if batch_no >= config["itr_per_epoch"]:
                     break
 
-            # Step the discriminator scheduler every epoch
-            if epoch_no >= warmup_epochs:
-                lr_scheduler_D.step()
+        # Step the discriminator scheduler every epoch
+        if epoch_no >= warmup_epochs:
+            lr_scheduler_D.step()
 
         # Validation loop
         if valid_loader is not None and (epoch_no + 1) % valid_epoch_interval == 0:
@@ -126,17 +126,19 @@ def train(
             # Use the validation loss to update the generator's learning rate scheduler
             lr_scheduler_G.step(avg_loss_valid)
 
+            # Save the best model if validation loss improves
             if avg_loss_valid < best_valid_loss:
                 best_valid_loss = avg_loss_valid
-
-                # Display the best loss of the epoch
+                if foldername != "":
+                    torch.save(model.state_dict(), best_model_path)
                 print(
                     f"\nBest validation loss updated to {avg_loss_valid} at epoch {epoch_no}"
                 )
 
-    # Save only the final model at the end of training
+    # Save the final model at the end of training
     if foldername != "":
-        torch.save(model.state_dict(), output_path)
+        torch.save(model.state_dict(), final_model_path)
+        print(f"\nFinal model saved to {final_model_path}")
 
 # get the quantile loss for CRPS using weighted error based on q
 def quantile_loss(target, forecast, q: float, eval_points) -> float:
@@ -185,36 +187,42 @@ def calc_quantile_CRPS_sum(target, forecast, eval_points, mean_scaler, scaler):
 # evaluate the models performance 
 def evaluate(model, test_loader, nsample=100, scaler=1, mean_scaler=0, foldername=""):
 
-    with torch.no_grad(): # we don't need to calculate the gradients
-        model.eval() # set the model into evaluation mode
+    # Load the best saved model
+    if foldername != "":
+        best_model_path = foldername + "/best_model.pth"
+        model.load_state_dict(torch.load(best_model_path))
+        print("Loaded best model from", best_model_path)
+    else:
+        print("No foldername provided, evaluation will use the current model state.")
 
-        # set up all scores to default 0
+    with torch.no_grad():
+        model.eval()
+
+        # Initialize accumulators for storing results
         mse_total = 0
         mae_total = 0
         evalpoints_total = 0
-
-        # initialize accumulators for storing results
         all_target = []
         all_observed_point = []
         all_observed_time = []
         all_evalpoint = []
         all_generated_samples = []
 
-        # iterate through all the test batches
+        # Iterate through all the test batches
         with tqdm(test_loader, mininterval=5.0, maxinterval=50.0) as it:
             for batch_no, test_batch in enumerate(it, start=1):
                 output = model.evaluate(test_batch, nsample)
                 
-                # get outputs from evaluation
+                # Get outputs from evaluation
                 samples, c_target, eval_points, observed_points, observed_time = output 
 
-                # permute the tensors to match the correct dimensions for processing
-                samples = samples.permute(0, 1, 3, 2)  # (B,nsample,L,K)
-                c_target = c_target.permute(0, 2, 1)  # (B,L,K)
+                # Permute the tensors to match the correct dimensions for processing
+                samples = samples.permute(0, 1, 3, 2)  # (B, nsample, L, K)
+                c_target = c_target.permute(0, 2, 1)  # (B, L, K)
                 eval_points = eval_points.permute(0, 2, 1)
                 observed_points = observed_points.permute(0, 2, 1)
 
-                # add ouputs to the list of results
+                # Add outputs to the list of results
                 samples_median = samples.median(dim=1)
                 all_target.append(c_target)
                 all_evalpoint.append(eval_points)
@@ -222,15 +230,15 @@ def evaluate(model, test_loader, nsample=100, scaler=1, mean_scaler=0, foldernam
                 all_observed_time.append(observed_time)
                 all_generated_samples.append(samples)
 
-                # calculate MSE and MAE for current batch
+                # Calculate MSE and MAE for current batch
                 mse_current = (
                     ((samples_median.values - c_target) * eval_points) ** 2
                 ) * (scaler ** 2)
                 mae_current = (
-                    torch.abs((samples_median.values - c_target) * eval_points) 
+                    torch.abs((samples_median.values - c_target) * eval_points)
                 ) * scaler
 
-                # update the overall MSE and MAE
+                # Update the overall MSE and MAE
                 mse_total += mse_current.sum().item()
                 mae_total += mae_current.sum().item()
                 evalpoints_total += eval_points.sum().item()
@@ -244,7 +252,7 @@ def evaluate(model, test_loader, nsample=100, scaler=1, mean_scaler=0, foldernam
                     refresh=True,
                 )
 
-            # save general results
+            # Save general results
             with open(
                 foldername + "/generated_outputs_nsample" + str(nsample) + ".pk", "wb"
             ) as f:
@@ -254,7 +262,7 @@ def evaluate(model, test_loader, nsample=100, scaler=1, mean_scaler=0, foldernam
                 all_observed_time = torch.cat(all_observed_time, dim=0)
                 all_generated_samples = torch.cat(all_generated_samples, dim=0)
 
-                pickle.dump( # this part actually does the saving
+                pickle.dump(  # This part actually does the saving
                     [
                         all_generated_samples,
                         all_target,
@@ -267,7 +275,7 @@ def evaluate(model, test_loader, nsample=100, scaler=1, mean_scaler=0, foldernam
                     f,
                 )
 
-            # get CRPS and CRPS sum
+            # Get CRPS and CRPS sum
             CRPS = calc_quantile_CRPS(
                 all_target, all_generated_samples, all_evalpoint, mean_scaler, scaler
             )
@@ -278,7 +286,7 @@ def evaluate(model, test_loader, nsample=100, scaler=1, mean_scaler=0, foldernam
             with open(
                 foldername + "/result_nsample" + str(nsample) + ".pk", "wb"
             ) as f:
-                pickle.dump( # save CRPS and CRPS sum
+                pickle.dump(  # Save CRPS and CRPS sum
                     [
                         np.sqrt(mse_total / evalpoints_total),
                         mae_total / evalpoints_total,
@@ -287,7 +295,8 @@ def evaluate(model, test_loader, nsample=100, scaler=1, mean_scaler=0, foldernam
                     f,
                 )
 
-                # display all the results from the evaluation
+                # Display all the results from the evaluation
+                print("Evaluation Results:")
                 print("RMSE:", np.sqrt(mse_total / evalpoints_total))
                 print("MAE:", mae_total / evalpoints_total)
                 print("CRPS:", CRPS)
