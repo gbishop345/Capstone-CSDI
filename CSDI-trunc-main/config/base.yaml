@@ -2,13 +2,13 @@
 
 train:
   epochs: 200
-  batch_size: 16 
+  batch_size: 32
   lr: 1.0e-3
   itr_per_epoch: 1.0e+8
 
 loss:
-  lambda_gan: 0.15  # Weight for the GAN loss
-  lambda_js: 0.15   # Weight for the JS divergence loss
+  lambda_gan: 0.11  # Weight for the GAN loss
+  lambda_js: 0.1   # Weight for the JS divergence loss
 
 diffusion:
   layers: 4 
