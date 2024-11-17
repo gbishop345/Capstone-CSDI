@@ -79,6 +79,8 @@ class diff_CSDI(nn.Module):
     def __init__(self, config, inputdim=2):
         super().__init__()
         self.channels = config["channels"]
+        self.T_trunc = config["T_trunc"]
+        self.side_dim = config["side_dim"]
 
         self.diffusion_embedding = DiffusionEmbedding(
             num_steps=config["num_steps"],
@@ -94,7 +96,7 @@ class diff_CSDI(nn.Module):
         self.residual_layers = nn.ModuleList(
             [
                 ResidualBlock(
-                    side_dim=config["side_dim"],
+                    side_dim=self.side_dim,
                     channels=self.channels,
                     diffusion_embedding_dim=config["diffusion_embedding_dim"],
                     nheads=config["nheads"],
@@ -104,32 +106,70 @@ class diff_CSDI(nn.Module):
             ]
         )
 
+        # Special layer that activates only at T_trunc
+        self.trunc_layer = nn.ModuleList(
+            [
+                ResidualBlock(
+                    side_dim=self.side_dim,
+                    channels=self.channels,
+                    diffusion_embedding_dim=config["diffusion_embedding_dim"],
+                    nheads=config["nheads"],
+                    is_linear=config["is_linear"],
+                )
+                for _ in range(2)
+            ]
+        )
+
     def forward(self, x, cond_info, diffusion_step):
-        # x: input data
-        # cond_indo: additional conditional info
-        # diffusion_step: the current step in the diffusion process
+        B, inputdim, K, L = x.shape
 
-        B, inputdim, K, L = x.shape # get the different dimensions of the input data
+        # Input projection
+        x = x.reshape(B, inputdim, K * L)
+        x = self.input_projection(x)
+        x = F.relu(x)
+        x = x.reshape(B, self.channels, K, L)
 
-        x = x.reshape(B, inputdim, K * L) # flatten the K, L dimension for 1D convolution
-        x = self.input_projection(x) # convolution layer to transform input to channels
-        x = F.relu(x) # non linear activation function
-        x = x.reshape(B, self.channels, K, L) # undo the K,L flattening
+        # Diffusion embedding
+        diffusion_emb = self.diffusion_embedding(diffusion_step)
 
-        diffusion_emb = self.diffusion_embedding(diffusion_step) # get the diffusion embedding
-
-        skip = [] # connections to skip
-        for layer in self.residual_layers: # for each layer we need to process x based on cond_info
+        # Standard residual layers
+        skip = []
+        for layer in self.residual_layers:
             x, skip_connection = layer(x, cond_info, diffusion_emb)
             skip.append(skip_connection)
 
-        # skip connections and normalize values to balance contribtution of all residual layers. 
-        x = torch.sum(torch.stack(skip), dim=0) / math.sqrt(len(self.residual_layers)) 
-        x = x.reshape(B, self.channels, K * L) # flatten K,L for final projection
-        x = self.output_projection1(x)  # maps output back to channels (B,channel,K*L)
-        x = F.relu(x) # non linear activation function
-        x = self.output_projection2(x)  # maps output back to 1 (B,1,K*L)
-        x = x.reshape(B, K, L) # reshape back to original input dimensions
+        # Combine skip connections
+        x = torch.sum(torch.stack(skip), dim=0) / math.sqrt(len(self.residual_layers))
+
+        # Apply truncation layers at T_trunc
+        t_trunc_indices = (diffusion_step == self.T_trunc - 1).nonzero(as_tuple=True)[0]
+        if t_trunc_indices.numel() > 0:
+            x_t_trunc = x[t_trunc_indices]
+            cond_info_t_trunc = cond_info[t_trunc_indices]
+            diffusion_emb_t_trunc = diffusion_emb[t_trunc_indices]
+
+            # Sequentially apply each block in the truncation layer
+            skip_t_trunc = []
+            for trunc_block in self.trunc_layer:
+                x_t_trunc, skip_connection_t_trunc = trunc_block(
+                    x_t_trunc, cond_info_t_trunc, diffusion_emb_t_trunc
+                )
+                skip_t_trunc.append(skip_connection_t_trunc)
+
+            # Combine skip connections from truncation blocks
+            skip_t_trunc = torch.sum(torch.stack(skip_t_trunc), dim=0) / math.sqrt(len(self.trunc_layer))
+            skip.append(skip_t_trunc)
+
+            # Assign back the processed x_t_trunc to x
+            x[t_trunc_indices] = x_t_trunc
+
+        # Output projection
+        x = x.reshape(B, self.channels, K * L)
+        x = self.output_projection1(x)
+        x = F.relu(x)
+        x = self.output_projection2(x)
+        x = x.reshape(B, K, L)
+
         return x
 
 # residual blocks to improve stable model training
@@ -223,3 +263,90 @@ class ResidualBlock(nn.Module):
         residual = residual.reshape(base_shape) # get the residual back to original shape
         skip = skip.reshape(base_shape) # get the skip back to original shape
         return (x + residual) / math.sqrt(2.0), skip # return the x + residual scaled for better residual connection
+
+
+'''
+this doesnt work well but I think a residual block that is similar 
+to the base one but slightly modified/smaller would be best
+I've just been playing around with different architectures
+'''
+class TruncResidualBlock(nn.Module):
+    def __init__(self, channels, side_dim):
+        super().__init__()
+        self.channels = channels
+        self.side_dim = side_dim
+
+        # Residual projection to match dimensions
+        self.residual_conv = nn.Conv1d(channels + side_dim, channels, kernel_size=1)
+
+        # Downsampling layers
+        self.down1 = nn.Sequential(
+            nn.Conv1d(channels + side_dim, channels, kernel_size=3, padding=1),
+            nn.LeakyReLU(negative_slope=0.2),
+            nn.Conv1d(channels, channels, kernel_size=3, padding=1),
+            nn.LeakyReLU(negative_slope=0.2)
+        )
+        self.pool = nn.MaxPool1d(kernel_size=2, stride=2)
+
+        # Bottleneck
+        self.bottleneck = nn.Sequential(
+            nn.Conv1d(channels, channels, kernel_size=3, padding=1),
+            nn.BatchNorm1d(channels),
+            nn.LeakyReLU(negative_slope=0.2),
+            nn.Conv1d(channels, channels, kernel_size=3, padding=1),
+            nn.BatchNorm1d(channels),
+            nn.LeakyReLU(negative_slope=0.2)
+        )
+
+        # Projection layer for cond_info
+        self.cond_projection = nn.Conv1d(self.side_dim, self.channels, kernel_size=1)
+
+        # Upsampling layers
+        self.up_sample = nn.Upsample(scale_factor=2, mode='nearest')
+        self.up_conv1 = nn.Sequential(
+            nn.Conv1d(channels * 2, channels, kernel_size=3, padding=1),
+            nn.BatchNorm1d(channels),
+            nn.LeakyReLU(negative_slope=0.2)
+        )
+        self.up_conv2 = nn.Sequential(
+            nn.Conv1d(channels, channels, kernel_size=3, padding=1),
+            nn.BatchNorm1d(channels),
+            nn.LeakyReLU(negative_slope=0.2)
+        )
+
+    def forward(self, x, cond_info):
+        B, channels, K, L = x.shape
+
+        # Reshape inputs for convolution
+        x = x.reshape(B, channels, K * L)  # Shape: (B, channels, N)
+        cond_info = cond_info.reshape(B, self.side_dim, K * L)  # Shape: (B, side_dim, N)
+
+        # Concatenate x and cond_info along the channel dimension
+        x_concat = torch.cat([x, cond_info], dim=1)  # Shape: (B, channels + side_dim, N)
+
+        # Residual projection
+        x_residual = self.residual_conv(x_concat)  # Shape: (B, channels, N)
+
+        # Downsampling with residual connection
+        x1 = self.down1(x_concat) + x_residual  # Shape: (B, channels, N)
+        x_pooled = self.pool(x1)  # Shape: (B, channels, N//2)
+
+        # Bottleneck
+        bottleneck_output = self.bottleneck(x_pooled)  # Shape: (B, channels, N//2)
+
+        # Project cond_info to match bottleneck_output channels
+        cond_info_pooled = cond_info[:, :, :bottleneck_output.size(2)]  # Match spatial dimension
+        cond_info_proj = self.cond_projection(cond_info_pooled)  # Shape: (B, channels, N//2)
+
+        # Add projected cond_info to bottleneck_output
+        bottleneck_output += cond_info_proj
+
+        # Upsampling
+        x_up = self.up_sample(bottleneck_output)  # Shape: (B, channels, N)
+        x_up = torch.cat([x1, x_up], dim=1)  # Shape: (B, channels * 2, N)
+        x_up = self.up_conv1(x_up)  # Shape: (B, channels, N)
+        x_up = self.up_conv2(x_up)  # Shape: (B, channels, N)
+
+        # Reshape back to original dimensions
+        x_reconstructed = x_up.reshape(B, self.channels, K, L)
+        return x_reconstructed
