@@ -161,6 +161,9 @@ class CSDI_base(nn.Module):
         B, K, L = observed_data.shape
 
         # Select a specific time step for validation, otherwise sample randomly
+        '''
+        this part to sample T_trunc more often is new
+        '''
         if is_train != 1:
             t = (torch.ones(B) * set_t).long().to(self.device)
         else:
@@ -188,6 +191,9 @@ class CSDI_base(nn.Module):
         loss = (residual ** 2).sum() / (num_eval if num_eval > 0 else 1)
 
         # Apply GAN loss and JS divergence at T_trunc
+        '''
+        all loss function calulation at T_trunc is new
+        '''
         if (t == self.T_trunc - 1).any():
             t_trunc_indices = (t == self.T_trunc - 1).nonzero(as_tuple=True)[0]
 
@@ -219,6 +225,9 @@ class CSDI_base(nn.Module):
 
         return loss
 
+    '''
+    discriminator loss function is new
+    '''
     def compute_discriminator_loss(self, observed_data, cond_mask, observed_mask, side_info, observed_tp, is_train):
         B, K, L = observed_data.shape
 
@@ -248,25 +257,18 @@ class CSDI_base(nn.Module):
         fake_output = self.discriminator(fake_data_at_T_trunc, temb)
 
         # Labels for real and fake samples
-        # real_labels = torch.ones_like(real_output).to(self.device)
-        # fake_labels = torch.zeros_like(fake_output).to(self.device)
         real_labels = torch.zeros(B, dtype=torch.long).to(self.device)  # Class 0 for real
         fake_labels = torch.ones(B, dtype=torch.long).to(self.device)   # Class 1 for fake
 
         # Implement label flipping
-        flip_prob = 0.03  # 5% probability to flip labels
-        # flip_mask_real = torch.rand_like(real_labels) < flip_prob
-        # flip_mask_fake = torch.rand_like(fake_labels) < flip_prob
+        flip_prob = 0.03  # 3% probability to flip labels
         flip_mask_real = torch.rand(B) < flip_prob
         flip_mask_fake = torch.rand(B) < flip_prob
 
         
         # Flip the labels
-        # real_labels = torch.where(flip_mask_real, torch.zeros_like(real_labels), real_labels)
-        # fake_labels = torch.where(flip_mask_fake, torch.ones_like(fake_labels), fake_labels)
         real_labels[flip_mask_real] = 1  # Flip real labels to fake class
         fake_labels[flip_mask_fake] = 0  # Flip fake labels to real class
-
         
         # Binary Cross-Entropy Loss for discriminator
         D_loss_real = F.cross_entropy(real_output, real_labels)
@@ -374,7 +376,7 @@ class CSDI_base(nn.Module):
         
         # return everything for later evaluation
         return samples, observed_data, target_mask, observed_mask, observed_tp
-    
+
 # Utility functions like normalization and nonlinearity
 def nonlinearity(x):
     return x * torch.sigmoid(x)
@@ -383,6 +385,9 @@ def Normalize(in_channels):
     return nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
 
 # 1D Residual Block with Leaky ReLU and Dropout
+'''
+Resenet class for the discriminator is new
+'''
 class ResnetBlock1D(nn.Module):
     def __init__(self, in_channels, out_channels=None, conv_shortcut=False, dropout=0.3, temb_channels=None):
         super().__init__()
@@ -456,6 +461,9 @@ class ResnetBlock1D(nn.Module):
         return x + h
 
 # 1D Discriminator Block
+'''
+discriminator class is new
+'''
 class Discriminator(nn.Module):
     def __init__(self, input_channels, hidden_dim=32, temb_dim=64):
         super().__init__()
