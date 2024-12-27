@@ -163,6 +163,7 @@ class CSDI_base(nn.Module):
         # Select a specific time step for validation, otherwise sample randomly
         '''
         this part to sample T_trunc more often is new
+        lines 168 - 176
         '''
         if is_train != 1:
             t = (torch.ones(B) * set_t).long().to(self.device)
@@ -193,6 +194,7 @@ class CSDI_base(nn.Module):
         # Apply GAN loss and JS divergence at T_trunc
         '''
         all loss function calulation at T_trunc is new
+        lines 199 - 226
         '''
         if (t == self.T_trunc - 1).any():
             t_trunc_indices = (t == self.T_trunc - 1).nonzero(as_tuple=True)[0]
@@ -227,6 +229,7 @@ class CSDI_base(nn.Module):
 
     '''
     discriminator loss function is new
+    lines 234 - 281
     '''
     def compute_discriminator_loss(self, observed_data, cond_mask, observed_mask, side_info, observed_tp, is_train):
         B, K, L = observed_data.shape
@@ -387,6 +390,7 @@ def Normalize(in_channels):
 # 1D Residual Block with Leaky ReLU and Dropout
 '''
 Resenet class for the discriminator is new
+lines 395 - 465
 '''
 class ResnetBlock1D(nn.Module):
     def __init__(self, in_channels, out_channels=None, conv_shortcut=False, dropout=0.3, temb_channels=None):
@@ -463,6 +467,7 @@ class ResnetBlock1D(nn.Module):
 # 1D Discriminator Block
 '''
 discriminator class is new
+lines 472 - 502
 '''
 class Discriminator(nn.Module):
     def __init__(self, input_channels, hidden_dim=32, temb_dim=64):
