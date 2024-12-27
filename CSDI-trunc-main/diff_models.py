@@ -107,6 +107,10 @@ class diff_CSDI(nn.Module):
         )
 
         # Special layer that activates only at T_trunc
+        '''
+        this special layer is new
+        lines 114 - 125
+        '''
         self.trunc_layer = nn.ModuleList(
             [
                 ResidualBlock(
@@ -142,6 +146,10 @@ class diff_CSDI(nn.Module):
         x = torch.sum(torch.stack(skip), dim=0) / math.sqrt(len(self.residual_layers))
 
         # Apply truncation layers at T_trunc
+        '''
+        this section for the special layer in foward pass is new
+        line 153 - 172
+        '''
         t_trunc_indices = (diffusion_step == self.T_trunc - 1).nonzero(as_tuple=True)[0]
         if t_trunc_indices.numel() > 0:
             x_t_trunc = x[t_trunc_indices]
